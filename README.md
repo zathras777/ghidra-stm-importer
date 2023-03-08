@@ -33,3 +33,11 @@ This allows me to easily add what I need to new Ghidra projects but I will likel
 The uber simple parsing done of the headers means that some manual intervention is needed prior to the generated files being usable :-) Code is intended to be simple as the next time I look at it may be a while...
 
 Pull requests for improvements and corrections welcome.
+
+## Changes
+
+### 8th Mar 2023
+- added the automatic creation of "standard" types in the Ghidra Data Type Manager as the usual method of finding them wasn't working
+- added extraction of labels for defined areas and creation
+- fixed the print statements (been too long since I wrote Python2 code)
+- tidied up updating the enum values to ensure it's done

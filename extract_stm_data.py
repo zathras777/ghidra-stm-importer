@@ -5,24 +5,34 @@ import re
 START_RE = re.compile("[enum|struct|typedef|#define]")
 END_RE = re.compile(".*\}.*;")
 ENUM_RE = re.compile(".*([a-zA-Z0-9_]+).*=.*([0-9hx]+).*,(.*?)")
-NUM_RE = re.compile("(0x)?([0-9A-Fa-f]+)U?L?")
+NUM_RE = re.compile("^(0x([0-9A-Fa-f]+)|[\-0-9]+)U?L?")
+CAST_RE = re.compile("\(\(([A-Za-z0-9_ \*]+)\)\s*(\(?[A-Za-z0-9_+ \<]+\)?)\s*?\)")
+DEFINE_RE = re.compile(r'\#define\s+(?P<name>[_A-Za-z0-9]+)\s*(?P<value>[\(\)A-Za-z0-9 _+\<\*]+)\s*?(?P<comment>.*)?')        
 
 
 def tidy_comment(comm:str) -> str:
     return comm.replace("/*!<", "").replace("*/", "").replace("/*", "").strip()
 
 
+def str_to_int(txt:str) -> int:
+    txt = txt.replace("U", "").replace("L", "").strip()
+    if '0x' in txt:
+        txt = txt.replace("U", "").replace("L", "")
+        return int(txt, 16)
+    return int(txt)
+
+
 def get_value(val:str):
     val = val.replace(",", "").strip()
     if val == "":
         return -1
-    num = NUM_RE.search(val)
+    num = NUM_RE.match(val)
     if num is None:
         return val
-    if num.group(1) is not None:
-        return int(num.group(2), 16)
+    if '0x' in val:
+        return int(num.group(1), 16)
     try:
-        return int(num.group(2))
+        return int(num.group(1))
     except ValueError:
         return val
 
@@ -79,8 +89,10 @@ class ParsedTypes:
         self.typedefs:dict = {}
         self.categories:list[str] = []
         self.constants:dict[str, int] = {}
+        self.labels:dict = {}
 
     def create_data(self):
+        self.update_enums()
         def quote(x):
             return '"'+x+'"'
         data = "Categories = [\n"
@@ -100,6 +112,9 @@ class ParsedTypes:
             for cc in s.fields:
                 data += f"        {cc},\n"
             data += "    ],\n"
+        data += "}\nLabels = {\n"
+        for l, d in self.labels.items():
+            data += f"    {quote(l)}: {d},\n"
         data += "}\n"
         return data
 
@@ -146,7 +161,7 @@ class ParsedTypes:
         enum = Enum(cat, txt[-1][1:-1].strip())
 
         for entry in txt[1:-1]:
-            if entry == "{":
+            if entry == "{" or entry.startswith("/*"):
                 continue
             while '  ' in entry:
                 entry = entry.replace('  ', ' ')
@@ -197,20 +212,53 @@ class ParsedTypes:
             st.add(outputs)
         self.structures.append(st)
 
-    def add_define(self, category:str, txt:list[str]):
-        if '()' in txt[0] or txt[0].startswith("#if"):
-            return
-        while '  ' in txt[0]:
-                txt[0] = txt[0].replace('  ', ' ')
-        parts = txt[0].split()
+    def txt_to_int(self, val_txt:str):
+        if len(val_txt) == 0:
+            return None
+        if val_txt in ['+', '<<', '>>']:
+            return val_txt
+        elif NUM_RE.match(val_txt) is None:
+            if val_txt not in self.constants:
+                print(f"Missing constant: {val_txt}")
+                return None
+            return self.constants[val_txt]
+        return str_to_int(val_txt)
 
-        if len(parts) < 3 or "(" in parts[1] or parts[2][0] != "(" or parts[2][-1] != ")":
+    def get_value(self, val_txt:str) -> int:
+        val_txt = val_txt.strip().replace("(", "").replace(")", "")
+        parts = val_txt.split(' ')
+        if len(parts) == 1:
+            return self.txt_to_int(val_txt)
+
+        vals = [self.txt_to_int(p.strip()) for p in parts]
+        if vals[1] == "+":
+            return vals[0] + vals[2]
+        elif vals[1] == "<<":
+            return vals[0] << vals[2]
+        return vals[0]
+        
+    def add_define(self, category:str, txt:list[str]):
+        if '()' in txt[0] or txt[0].startswith("#if") or txt[0].startswith("#elif"):
             return
-        vals = parts[2].split(")")
-        if len(vals) >= 3:
-            self.constants[parts[1]] = get_value(vals[1])
-        else:
-            self.constants[parts[1]] = get_value(vals[0])
+
+        ck = DEFINE_RE.match(txt[0])
+        if ck is None:
+            print("Failed to parse " + txt[0])
+            return
+        if ck.group('name').startswith("IS_"):
+            return
+
+        if "((" in ck.group('value'):
+            var = CAST_RE.match(ck.group('value'))
+            if var is not None:
+                self.labels[ck.group('name')] = [var.group(1), self.get_value(var.group(2))]
+            return
+        
+        val = self.get_value(ck.group('value'))
+        if val is None and ck.group('value') in self.labels:
+            self.labels[ck.group('name')] = self.labels[ck.group('value')]
+
+        self.constants[ck.group('name')] = val
 
     def add_typedef(self, category:str, txt:str):
         while '  ' in txt:
@@ -232,7 +280,6 @@ class ParsedTypes:
             if os.path.isdir(poss):
                 continue
             self.parse_file(os.path.join(dd, f))
-        self.update_enums()
 
 def main():
     if len(sys.argv) < 3:

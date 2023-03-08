@@ -9,6 +9,11 @@ from ghidra.program.model.data import CategoryPath, \
     TypedefDataType, \
     ArrayDataType, \
     DataTypeConflictHandler
+from ghidra.program.model.data import UnsignedIntegerDataType, \
+    IntegerDataType, ShortDataType, UnsignedShortDataType, \
+    CharDataType, UnsignedCharDataType
+from ghidra.program.model.symbol import SourceType
+from ghidra.program.model.address import AddressFactory
 
 
 def enum_length(data):
@@ -22,29 +27,34 @@ def enum_length(data):
 class StmImporter:
     def __init__(self, filename):
         if not os.path.exists(filename):
-            print("Unable to import %s as it does not appear to exist?".format(filename))
+            print("Unable to import {} as it does not appear to exist?".format(filename))
             return
         if os.path.isdir(filename):
-            print("Unable to import %s as it is a directory".format(filename))
+            print("Unable to import {} as it is a directory".format(filename))
             return
 
         sys.path.append(os.path.dirname(filename))
         mod_name, _ = os.path.splitext(os.path.basename(filename))
         self.data = importlib.import_module(mod_name)
         self.dtm = currentProgram.getDataTypeManager()
+        self.symbol_table = currentProgram.getSymbolTable()
+        self.address_space = currentProgram.getAddressFactory().getDefaultAddressSpace()
+        self.listing = currentProgram.getListing()
 
     def import_all(self):
         self.add_categories()
         self.add_enums()
+        self.ensure_standard_types()
         self.add_typedefs()
         self.add_structures()
+        self.add_labels()
 
-    def get_data_type(self, cat, fld_type):
+    def get_data_type(self, cat, fld_type, base_type=False):
         data_type_re = re.compile("(?P<type>[a-zA-Z_0-9]+)\s*(?P<pointer>\*)?\s*(?P<array>\[[0-9]+\])?")
         data_type = None
         opts = data_type_re.match(fld_type)
         if opts is None:
-            print("Error extracing type information from %s".format(fld_type))
+            print("Error extracing type information from {}".format(fld_type))
             return None
         matches = []
         self.dtm.findDataTypes(opts.group('type'), matches)
@@ -54,19 +64,52 @@ class StmImporter:
             if opts.group('type') in self.data.Structures:
                 self.add_structure(cat+":"+opts.group('type'))
                 return self.get_data_type(cat, fld_type)
-            print("Unable to find a data type for %s".format(opts.group('type')))
+            print("Unable to find a data type for {}".format(opts.group('type')))
             return None
 
+        if base_type:
+            return data_type
+        
         if opts.group('pointer') is not None:
             data_type = self.dtm.getPointer(data_type)
 
         if opts.group('array') is not None:
             len = int(opts.group('array')[1:-1])
             array_data_type = ArrayDataType(data_type, len, data_type.length)
-            array_data_type.setCategoryPath(CategoryPath(cat))
+            if cat != "":
+                array_data_type.setCategoryPath(CategoryPath(cat))
             data_type = self.dtm.addDataType(array_data_type,DataTypeConflictHandler.DEFAULT_HANDLER)
 
         return data_type
+
+    def ensure_standard_types(self):
+        width = currentProgram.getDefaultPointerSize()
+        cat = CategoryPath("/")
+
+        std_types = {
+            'uint32_t': [4, 'Unsigned'],
+            'int32_t': [4, ''],
+            'uint16_t': [2, 'Unsigned'],
+            'int16_t': [2, ''],
+            'uint8_t': [1, 'Unsigned'],
+            'int8_t': [1, ''],
+        }
+        
+        for typ, opts in std_types.items():
+            ck = self.get_data_type("", typ)
+            if ck is None:
+                obj = None
+                if width == opts[0]:
+                    obj = globals().get(opts[1]+"IntegerDataType")
+                elif width == opts[0] * 2:
+                    obj = globals().get(opts[1]+"ShortDataType")
+                elif opts[0] == 1:
+                    obj = globals().get(opts[1]+"CharDataType")
+                if obj is None:
+                    print("Unable to add standard type {} as no matching type was found".format(typ))
+                    continue
+                td = TypedefDataType(cat, typ, obj())
+                self.dtm.addDataType(td, DataTypeConflictHandler.REPLACE_HANDLER)
 
     def add_categories(self):
         if not hasattr(self.data, "Categories"):
@@ -96,7 +139,7 @@ class StmImporter:
 
             dt = self.get_data_type(cat, name)
             if dt is None:
-                print("WARNING: Unable to add typedef %s as failed to find data type %s".format(tdef, name))
+                print("WARNING: Unable to add typedef {} as failed to find data type {}".format(tdef, name))
                 continue
 
             td = TypedefDataType(CategoryPath(cat), tdef, dt)
@@ -110,7 +153,7 @@ class StmImporter:
         for f in self.data.Structures[structure_name]:        
             dt = self.get_data_type(cat, f[0])
             if dt is None:
-                print("WARNING: Unable to add field %s:%s due no matching data type for %s".format(name, f[1], f[0]))
+                print("WARNING: Unable to add field {}:{} due no matching data type for {}".format(name, f[1], f[0]))
                 continue
 
             if ':' in f[0]:
@@ -130,6 +173,36 @@ class StmImporter:
         for s_name in sorted(self.data.Structures.keys()):
             self.add_structure(s_name)
 
+    def add_labels(self):
+        if not hasattr(self.data, "Labels"):
+            return
+        
+        namespace = self.symbol_table.getNamespace("Peripherals", None)
+        if not namespace:
+            namespace = self.symbol_table.createNameSpace(None, "Peripherals", SourceType.ANALYSIS)
+
+        for lbl in sorted(self.data.Labels.keys()):
+            data = self.data.Labels[lbl]
+
+            addr = self.address_space.getAddress(data[1])
+            self.symbol_table.createLabel(addr, lbl, namespace, SourceType.USER_DEFINED)
+
+            dt = self.get_data_type("", data[0], base_type=True)
+
+            try:
+                self.listing.createData(addr, dt, False)
+            except ghidra.program.model.util.CodeUnitInsertionException:
+                pass
+
+            try:
+                mem = currentProgram.memory.createUninitializedBlock(lbl, addr, dt.length, False)
+                mem.setRead(True)
+                mem.setWrite(True)
+                mem.setExecute(False)
+                mem.setVolatile(True)
+                mem.setComment("Added by STM importer script for "+lbl)
+            except ghidra.program.model.mem.MemoryConflictException:
+                pass
 
 file_to_import = askFile("Choose STM definition file", "Load STM Definitions File")
 importer = StmImporter(str(file_to_import))
